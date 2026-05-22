@@ -4,13 +4,9 @@ const cors = require("cors");
 
 const app = express();
 
-app.use(
-  cors({
-    origin: "*",
-  })
-);
+app.use(cors({ origin: "*" }));
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // ======================
 // ESTADO
@@ -30,6 +26,19 @@ let state = {
   slope: null,
   score: 0,
   signal: null,
+
+  lastSignalDirection: null,
+  lastSignalPrice: null,
+  lastSignalTime: null,
+
+  wins: 0,
+  losses: 0,
+  canceladas: 0,
+
+  trades: [],
+
+  bestHour: null,
+  worstHour: null,
 };
 
 // ======================
@@ -91,12 +100,99 @@ function volatility(arr) {
 
 function slope(arr) {
   if (arr.length < 10) return null;
-
   return arr[arr.length - 1] - arr[arr.length - 10];
 }
 
 // ======================
-// MOTOR MATEMÁTICO
+// ANALISAR MELHOR/P IOR HORÁRIO
+// ======================
+function analyzeHours() {
+  const hours = {};
+
+  state.trades.forEach((t) => {
+    const h = t.time.slice(0, 2);
+
+    if (!hours[h]) {
+      hours[h] = {
+        win: 0,
+        loss: 0,
+      };
+    }
+
+    if (t.result === "WIN") hours[h].win++;
+    if (t.result === "LOSS") hours[h].loss++;
+  });
+
+  let best = null;
+  let worst = null;
+  let bestScore = -999;
+  let worstScore = 999;
+
+  for (const h in hours) {
+    const score =
+      hours[h].win - hours[h].loss;
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = h + ":00";
+    }
+
+    if (score < worstScore) {
+      worstScore = score;
+      worst = h + ":00";
+    }
+  }
+
+  state.bestHour = best;
+  state.worstHour = worst;
+}
+
+// ======================
+// AVALIAR SINAL
+// ======================
+function evaluateSignal() {
+  if (!state.lastSignalDirection) return;
+
+  const entry = state.lastSignalPrice;
+  const current = Number(state.price);
+
+  let result = "CANCELADA";
+
+  if (
+    state.lastSignalDirection === "CALL 🟢"
+  ) {
+    if (current > entry) result = "WIN";
+    if (current < entry) result = "LOSS";
+  }
+
+  if (
+    state.lastSignalDirection === "PUT 🔴"
+  ) {
+    if (current < entry) result = "WIN";
+    if (current > entry) result = "LOSS";
+  }
+
+  if (result === "WIN") state.wins++;
+  if (result === "LOSS") state.losses++;
+  if (result === "CANCELADA")
+    state.canceladas++;
+
+  state.trades.unshift({
+    signal: state.lastSignalDirection,
+    entry,
+    exit: current,
+    result,
+    time: state.lastSignalTime,
+  });
+
+  state.trades =
+    state.trades.slice(0, 20);
+
+  analyzeHours();
+}
+
+// ======================
+// MOTOR
 // ======================
 function updateMath() {
   const c = state.candles;
@@ -121,13 +217,18 @@ function updateMath() {
     state.sma34 &&
     state.rsi14
   ) {
-    const trend = state.sma9 - state.sma34;
-    const sideways = Math.abs(trend) < 0.3;
+    const trend =
+      state.sma9 - state.sma34;
+
+    const sideways =
+      Math.abs(trend) < 0.3;
 
     if (!sideways) {
       score += 35;
 
-      if (Math.abs(trend) > 0.8) {
+      if (
+        Math.abs(trend) > 0.8
+      ) {
         score += 20;
       }
 
@@ -151,23 +252,47 @@ function updateMath() {
 
   state.score = score;
   state.signal = signal;
+
+  if (
+    signal &&
+    signal !==
+      state.lastSignalDirection
+  ) {
+    state.lastSignalDirection =
+      signal;
+
+    state.lastSignalPrice =
+      Number(state.price);
+
+    state.lastSignalTime =
+      new Date().toLocaleTimeString();
+
+    setTimeout(
+      evaluateSignal,
+      600000
+    );
+  }
 }
 
 // ======================
-// CONEXÃO DERIV (TICKS)
+// DERIV
 // ======================
 const deriv = new WebSocket(
   "wss://ws.derivws.com/websockets/v3?app_id=1089"
 );
 
 deriv.on("open", () => {
-  console.log("🟢 conectado na Deriv");
+  console.log(
+    "🟢 conectado na Deriv"
+  );
 
-  state.status = "🟢 conectado";
+  state.status =
+    "🟢 conectado";
 
   deriv.send(
     JSON.stringify({
-      ticks_history: "1HZ25V",
+      ticks_history:
+        "1HZ25V",
       count: 600,
       end: "latest",
       subscribe: 1,
@@ -175,86 +300,79 @@ deriv.on("open", () => {
   );
 });
 
-deriv.on("message", (raw) => {
-  const data = JSON.parse(raw);
+deriv.on(
+  "message",
+  (raw) => {
+    const data =
+      JSON.parse(raw);
 
-  console.log("DERIV:", data);
+    if (
+      data.history &&
+      data.history.prices
+    ) {
+      state.candles =
+        data.history.prices.map(
+          (p) =>
+            Number(p)
+        );
 
-  // HISTÓRICO DOS ÚLTIMOS 600 TICKS
-  if (data.history && data.history.prices) {
-    state.candles = data.history.prices.map(
-      (p) => Number(p)
-    );
+      const last =
+        state.candles[
+          state.candles
+            .length - 1
+        ];
 
-    const last =
-      state.candles[
-        state.candles.length - 1
-      ];
+      state.price =
+        last.toFixed(2);
 
-    state.price = last.toFixed(2);
-    state.lastUpdate =
-      new Date().toISOString();
+      state.lastUpdate =
+        new Date().toISOString();
 
-    updateMath();
+      updateMath();
+    }
 
-    console.log(
-      "✅ Histórico carregado:",
-      state.candles.length
-    );
+    if (data.tick) {
+      const close =
+        Number(
+          data.tick.quote
+        );
+
+      state.price =
+        close.toFixed(2);
+
+      state.lastUpdate =
+        new Date().toISOString();
+
+      state.candles.push(
+        close
+      );
+
+      state.candles =
+        state.candles.slice(
+          -600
+        );
+
+      updateMath();
+    }
   }
-
-  // TICK AO VIVO
-  if (data.tick) {
-    const close = Number(
-      data.tick.quote
-    );
-
-    state.price =
-      close.toFixed(2);
-
-    state.lastUpdate =
-      new Date().toISOString();
-
-    state.candles.push(close);
-
-    state.candles =
-      state.candles.slice(-600);
-
-    updateMath();
-  }
-
-  // ERRO
-  if (data.error) {
-    console.log(
-      "ERRO DERIV:",
-      data.error
-    );
-  }
-});
-
-deriv.on("close", () => {
-  console.log("🔴 Deriv desconectou");
-  state.status = "🔴 desconectado";
-});
-
-deriv.on("error", (err) => {
-  console.log(
-    "ERRO WEBSOCKET:",
-    err.message
-  );
-
-  state.status = "🔴 erro";
-});
+);
 
 // ======================
 // API
 // ======================
-app.get("/status", (req, res) => {
-  res.json(state);
-});
+app.get(
+  "/status",
+  (req, res) => {
+    res.json(state);
+  }
+);
 
-app.listen(PORT, () => {
-  console.log(
-    "Servidor rodando na porta 3000"
-  );
-});
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      "Servidor rodando na porta",
+      PORT
+    );
+  }
+);
